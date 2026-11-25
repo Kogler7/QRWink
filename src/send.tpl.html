@@ -1,0 +1,855 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>发送端</title>
+<style>
+  html, body { height: 100%; }
+  /* 底部留出控制条的高度：二维码在剩下的空白里居中，不会被控制条盖住；
+     控制条隐藏时这块也保留，画面不会因为鼠标移动而跳动 */
+  body { margin: 0; background: #fff; color: #111; height: 100%;
+         box-sizing: border-box; padding-bottom: 64px; overflow: hidden;
+         display: flex; align-items: center; justify-content: center;
+         font: 13px/1.5 system-ui, "Microsoft YaHei", sans-serif; }
+  #code { display: block; image-rendering: pixelated; }
+  /* 默认什么都不显示：鼠标一动才浮出控制条，2 秒后自己消失 */
+  #bar { position: fixed; left: 0; right: 0; bottom: 0; padding: 0 12px 10px;
+         background: linear-gradient(to top, rgba(255,255,255,.97), rgba(255,255,255,.9));
+         border-top: 1px solid #e8eaef; opacity: 0; pointer-events: none;
+         transition: opacity .18s ease; }
+  #bar.show { opacity: 1; pointer-events: auto; }
+  #track { height: 14px; margin: 0 -12px 6px; cursor: pointer; position: relative; }
+  #track > i { position: absolute; left: 0; right: 0; top: 5px; height: 4px;
+               background: #e5e8ee; border-radius: 2px; }
+  #prog { position: absolute; left: 0; top: 5px; height: 4px; width: 0;
+          background: #2563eb; border-radius: 2px; }
+  #track:hover > i, #track:hover #prog { height: 6px; top: 4px; }
+  #row { display: flex; align-items: center; gap: 8px; }
+  #status { margin-left: auto; color: #555; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  #hint { position: fixed; left: 0; right: 0; bottom: 14px; text-align: center; color: #8b93a5;
+          font-size: 13px; transition: opacity .3s; pointer-events: none; }
+  #hint.off { opacity: 0; }
+  button { padding: 6px 12px; border: 0; border-radius: 6px; background: #2563eb; color: #fff;
+           font: inherit; font-weight: 600; cursor: pointer; }
+  button:disabled { background: #c3ccdb; cursor: default; }
+  button.plain { background: #eef1f6; color: #1f2937; font-weight: 500; }
+  select, input[type=file] { font: inherit; padding: 4px 6px; border: 1px solid #d6dae3;
+           border-radius: 6px; background: #fff; max-width: 190px; }
+  #warn { display: none; position: fixed; left: 0; right: 0; top: 0; z-index: 9;
+          padding: 8px 12px; background: #fdeaea; border-bottom: 1px solid #f5b5b5;
+          white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<div id="warn"></div>
+<canvas id="code" width="640" height="640"></canvas>
+<div id="hint">拖入文件开始 · 点击画面 开始/暂停 · 滚轮 换屏 · 底部进度条可拖</div>
+<div id="bar">
+  <div id="track"><i></i><b id="prog"></b></div>
+  <div id="row">
+  <input type="file" id="file">
+  <select id="density">
+    <option value="1398">保守 1398</option>
+    <option value="2799" selected>标准 2799</option>
+    <option value="4197">高 4197</option>
+  </select>
+  <select id="fps">
+    <option value="2">2 FPS</option>
+    <option value="3" selected>3 FPS</option>
+    <option value="4">4 FPS</option>
+    <option value="6">6 FPS</option>
+    <option value="8">8 FPS</option>
+    <option value="10">10 FPS</option>
+  </select>
+  <select id="mode">
+    <option value="3" selected>彩色 ×3</option>
+    <option value="1">灰度 ×1</option>
+  </select>
+  <button id="btnPlay" disabled>开始</button>
+  <button id="btnTest" class="plain">测速</button>
+  <button id="btnFull" class="plain">全屏</button>
+  <span id="status"></span>
+  </div>
+</div>
+<script>
+var __QRCODE__;
+
+(function () {
+  'use strict';
+
+  var $ = function (id) { return document.getElementById(id); };
+  var cv = $('code'), ctx = cv.getContext('2d');
+
+  var st = {
+    name: '', size: 0, b44: '', crc: 0, chunk: 2800, total: 0, ver: 0, ch: 3,
+    idx: 0, playing: false, fps: 3, timer: null, cache: {}, cacheCount: 0, seeking: false,
+    encTotal: 0, encDone: 0, compose: null, composeCtx: null
+  };
+
+  // ---------- 工具 ----------
+  var CRC_TABLE = (function () {
+    var t = new Uint32Array(256);
+    for (var n = 0; n < 256; n++) {
+      var c = n;
+      for (var k = 0; k < 8; k++) { c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1); }
+      t[n] = c >>> 0;
+    }
+    return t;
+  })();
+
+  function crc32(bytes) {
+    var c = 0xFFFFFFFF;
+    for (var i = 0; i < bytes.length; i++) { c = CRC_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8); }
+    return (c ^ 0xFFFFFFFF) >>> 0;
+  }
+
+  function hex(n, w) {
+    var s = (n >>> 0).toString(16);
+    while (s.length < w) { s = '0' + s; }
+    return s.toUpperCase();
+  }
+
+  // ---------- base44 ----------
+  // 让负荷只用 QR 的「字母数字」字符集（0-9 A-Z $%*+-./:），
+  // 同样的 QR 尺寸比字节模式多装 45%。44 个字符去掉空格，避免前后空白被裁剪。
+  var B44 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ$%*+-./:';
+
+  function b44enc(bytes) {
+    var out = [], i, b0, b1, v;
+    for (i = 0; i < bytes.length; i += 2) {
+      b0 = bytes[i];
+      if (i + 1 < bytes.length) {
+        b1 = bytes[i + 1];
+        v = b0 * 256 + b1;
+        out.push(B44.charAt(Math.floor(v / 1936) % 44));
+        v = v % 1936;
+        out.push(B44.charAt(Math.floor(v / 44)));
+        out.push(B44.charAt(v % 44));
+      } else {
+        out.push(B44.charAt(Math.floor(b0 / 44)));
+        out.push(B44.charAt(b0 % 44));
+      }
+    }
+    return out.join('');
+  }
+
+  function utf8(str) {
+    var out = [], i, c;
+    for (i = 0; i < str.length; i++) {
+      c = str.charCodeAt(i);
+      if (c < 0x80) { out.push(c); }
+      else if (c < 0x800) { out.push(0xC0 | (c >> 6), 0x80 | (c & 0x3F)); }
+      else if (c >= 0xD800 && c <= 0xDBFF) {
+        var c2 = str.charCodeAt(++i) || 0;
+        var cp = 0x10000 + ((c - 0xD800) << 10) + (c2 - 0xDC00);
+        out.push(0xF0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3F),
+                 0x80 | ((cp >> 6) & 0x3F), 0x80 | (cp & 0x3F));
+      } else { out.push(0xE0 | (c >> 12), 0x80 | ((c >> 6) & 0x3F), 0x80 | (c & 0x3F)); }
+    }
+    return out;
+  }
+
+  function warn(msg) {
+    var w = $('warn');
+    w.style.display = msg ? 'block' : 'none';
+    w.textContent = msg || '';
+  }
+
+  // 构建时会被替换成 false；直接打开模板文件时它是 true
+  var __TEMPLATE__ = true;
+  if (__TEMPLATE__) {
+    warn('这是源码模板（src/send.tpl.html），不能直接运行。\n'
+      + '请打开构建产物：sender/send.html');
+    return;
+  }
+
+  // ---------- 帧 ----------
+  // 定长头（无分隔符，所以负荷里可以出现 ':'）：
+  //   WNK/WNM | idx4 | total4 | ver2 | size8 | crc8 | fcrc4 | 负荷(base44)
+  // WNK = 数据帧，WNM = 元信息帧（文件名）。两者长度相同 → 版本相同 → 屏幕上尺寸恒定。
+  var HEAD = 33;
+
+  function fcrc(idxHex, payload) {
+    var c = 0xFFFFFFFF, i, j, str = idxHex + payload;
+    for (i = 0; i < str.length; i++) {
+      c ^= str.charCodeAt(i) & 0xFF;
+      for (j = 0; j < 8; j++) { c = (c >>> 1) ^ (0xEDB88320 & -(c & 1)); }
+    }
+    return ((c ^ 0xFFFFFFFF) >>> 0) & 0xFFFF;
+  }
+
+  function padTo(s) {
+    while (s.length < st.chunk) { s += '0'; }
+    return s;
+  }
+
+  // 每帧定长：短的那帧用 '0' 补齐，接收端按 size 截断
+  function payloadOf(i) { return padTo(st.b44.substr(i * st.chunk, st.chunk)); }
+
+  // 帧序号 0 是文件名，1..total 是数据帧
+  function totalFrames() { return st.total + 1; }
+  function screens() { return Math.ceil(totalFrames() / st.ch); }
+
+  function frameText(f) {
+    if (f === 0) {
+      var nm = utf8(st.name || 'data.bin');
+      var maxb = Math.floor(st.chunk * 2 / 3) - 1;
+      if (nm.length > maxb) { nm = nm.slice(0, maxb); }
+      var nb = new Uint8Array(nm);
+      // 名字字节补齐成偶数：base44 三个字符一组，奇数长度会剩 2 字符，补白后与填充错位
+      var nbEven = new Uint8Array(nb.length + (nb.length % 2));
+      nbEven.set(nb);
+      var body = padTo(b44enc(nbEven));
+      return 'WNM' + '0000' + hex(st.total, 4) + hex(st.ver, 2) + hex(nb.length, 8)
+        + hex(st.crc, 8) + hex(fcrc('0000', body), 4) + body;
+    }
+    var i = f - 1;
+    var payload = payloadOf(i);
+    var ix = hex(i, 4);
+    return 'WNK' + ix + hex(st.total, 4) + hex(st.ver, 2) + hex(st.size, 8)
+      + hex(st.crc, 8) + hex(fcrc(ix, payload), 4) + payload;
+  }
+
+  // 把一帧编成「每模块 1 像素」的位图（含静区）。
+  // 只做纯计算、不碰 DOM，所以同一份源码在页面里和 Worker 里都能跑。
+  function encodeText(text, hintVer) {
+    var qr = null, used = 0, lastErr = '';
+    // 同一份文件的帧长度相同 → 版本必然相同，先用上一帧的版本试一次，
+    // 装不下再回落到「由小到大找最小版本」（WNM 文件名帧长度不同，会走到这里）
+    var v0 = (hintVer >= 1 && hintVer <= 40) ? hintVer : 6;
+    for (var v = v0; v <= 40; v += 1) {
+      try {
+        var q = __QRCODE__(v, 'L');
+        q.addData(text, 'Alphanumeric');
+        q.make();
+        qr = q; used = v;
+        break;
+      } catch (e) {
+        lastErr = (e && (e.message || e)) || String(e);
+        if (v === v0 && v0 > 6) { v = 5; }     // 提示的版本装不下：回到从头找
+      }
+    }
+    if (!qr) {
+      throw new Error('这一帧编码失败：' + text.length + ' 字符；最大版本仍报：' + lastErr);
+    }
+    var n = qr.getModuleCount(), q = 4, size = n + q * 2;
+    var mask = new Uint8Array(size * size), x, y;
+    for (y = 0; y < n; y++) {
+      for (x = 0; x < n; x++) {
+        if (qr.isDark(y, x)) { mask[(y + q) * size + (x + q)] = 1; }
+      }
+    }
+    return { mask: mask, size: size, sym: n, version: used };
+  }
+
+  // 缓存能装下整份文件（每个条目约 4 KB，几千帧也就几十 MB），这样第二轮不用重编
+  var CACHE_MAX = 6000;
+
+  function moduleFor(text) {
+    var hit = st.cache[text];
+    if (hit) { return hit; }
+    if (st.cacheCount > CACHE_MAX) { st.cache = {}; st.cacheCount = 0; }
+    var r = encodeText(text, st.ver);
+    st.cache[text] = r;
+    st.cacheCount++;
+    return r;
+  }
+
+  // ---------- 编码线程池 ----------
+  var POOL = { ws: [], idle: [], ok: false, seq: 0, pending: {}, running: {}, want: [] };
+  var LIBSRC = null;
+
+  function libSrc() {
+    if (LIBSRC === null || LIBSRC === undefined) {
+      var el = document.getElementById('libqrcode');
+      LIBSRC = el ? el.textContent : '';
+    }
+    return LIBSRC;
+  }
+
+  function workerCode() {
+    return 'var module = { exports: {} }, exports = module.exports, define;\n'
+      + libSrc()
+      + '\nvar __QRCODE__ = (module.exports && (module.exports.default || module.exports)) || null;\n'
+      + 'if (__QRCODE__ && typeof __QRCODE__ !== "function" && __QRCODE__.qrcode) {'
+      + ' __QRCODE__ = __QRCODE__.qrcode; }\n'
+      + 'var encodeText = ' + encodeText.toString() + ';\n'
+      + 'self.onmessage = function (e) {\n'
+      + '  var d = e.data, r = null, err = null;\n'
+      + '  try { r = encodeText(d.text, d.ver); } catch (x) { err = String((x && (x.message || x)) || x); }\n'
+      + '  self.postMessage({ id: d.id, text: d.text, err: err,\n'
+      + '    size: r && r.size, sym: r && r.sym, version: r && r.version,\n'
+      + '    mask: r ? r.mask.buffer : null }, r ? [r.mask.buffer] : []);\n'
+      + '};\n';
+  }
+
+  function initPool() {
+    if (window.__NOWORKER__) { return; }
+    try {
+      if (typeof Worker !== 'function' || !libSrc()) { return; }
+      var url = URL.createObjectURL(new Blob([workerCode()], { type: 'text/javascript' }));
+      var hw = navigator.hardwareConcurrency || 4;
+      var n = Math.max(1, Math.min(3, hw - 1));
+      for (var i = 0; i < n; i++) {
+        var wk = new Worker(url);
+        wk.onmessage = function (e) {
+          var d = e.data, job = POOL.pending[d.id];
+          delete POOL.pending[d.id];
+          if (job) { delete POOL.running[job.text]; }
+          if (d.err) {
+            window.__POOLERR__ = d.err;
+          } else if (d.mask) {
+            st.cache[d.text] = { mask: new Uint8Array(d.mask), size: d.size, sym: d.sym, version: d.version };
+            st.cacheCount++;
+            st.encDone++;
+          }
+          POOL.idle.push(this);
+          pump();
+        };
+        wk.onerror = function (ev) {
+          POOL.ok = false;
+          window.__POOLERR__ = String((ev && ev.message) || 'worker error');
+        };
+        POOL.ws.push(wk);
+        POOL.idle.push(wk);
+      }
+      POOL.ok = POOL.ws.length > 0;
+    } catch (e) { POOL.ok = false; }
+  }
+
+  // 把一帧排进编码队列（已经编好的不重复排）
+  function request(text) {
+    if (!POOL.ok || !text) { return; }
+    if (st.cache[text] || POOL.running[text] || POOL.want.indexOf(text) >= 0) { return; }
+    POOL.want.push(text);
+    pump();
+  }
+
+  function pump() {
+    while (POOL.ok && POOL.want.length && POOL.idle.length) {
+      var text = POOL.want.shift();
+      if (st.cache[text]) { continue; }
+      var w = POOL.idle.pop();
+      var id = ++POOL.seq;
+      POOL.pending[id] = { text: text };
+      POOL.running[text] = 1;
+      try { w.postMessage({ id: id, text: text, ver: st.ver }); }
+      catch (e) {
+        delete POOL.pending[id]; delete POOL.running[text];
+        POOL.idle.push(w); POOL.ok = false;
+        break;
+      }
+    }
+  }
+
+  // 载入文件后把整份文件排进编码队列：Worker 在后台编，播放随时取
+  function requestAll() {
+    st.encTotal = 0; st.encDone = 0;
+    if (!POOL.ok || !st.total) { return; }
+    for (var f = 0; f <= st.total; f++) {
+      var txt = frameText(f);
+      if (!st.cache[txt]) { st.encTotal++; }
+      request(txt);
+    }
+  }
+
+  // 一屏最多三个帧，分别画进 R / G / B 三个通道：
+  // 每个通道单独看就是一张普通的单码图，解码器不用任何特殊处理。
+  function composeScreen(p) {
+    var parts = [], k;
+    for (k = 0; k < st.ch; k++) {
+      var f = p * st.ch + k;
+      parts.push(f < totalFrames() ? moduleFor(frameText(f)) : null);
+    }
+    var size = (parts[0] || parts[1] || parts[2]).size;
+    // 三帧长度相同，版本相同，尺寸必然一致；万一不一致就按最大的来（留白）
+    for (k = 0; k < parts.length; k++) { if (parts[k] && parts[k].size > size) { size = parts[k].size; } }
+
+    // 灰度模式只有一帧：三个通道都涂黑，才是真正的黑白
+    var draw = [parts[0], parts[1], parts[2]];
+    if (st.ch === 1) { draw = [parts[0], parts[0], parts[0]]; }
+
+    var img = new ImageData(size, size), d = img.data, i, c;
+    for (i = 0; i < d.length; i += 4) { d[i] = d[i + 1] = d[i + 2] = 255; d[i + 3] = 255; }
+    for (c = 0; c < 3; c++) {
+      var part = draw[c];
+      if (!part || part.size !== size) { continue; }
+      var m = part.mask;
+      for (i = 0; i < m.length; i++) {
+        if (m[i]) { d[i * 4 + c] = 0; }
+      }
+    }
+    // 复用同一个画布：每帧新建 canvas + ImageData 会产生大量垃圾，
+    // 慢机器上光 GC 就能吃掉几十毫秒
+    if (!st.compose || st.compose.width !== size) {
+      st.compose = document.createElement('canvas');
+      st.compose.width = size;
+      st.compose.height = size;
+      st.composeCtx = st.compose.getContext('2d');
+    }
+    st.composeCtx.putImageData(img, 0, 0);
+    return { canvas: st.compose, size: size };
+  }
+
+  function paint(screen) {
+    var avail = Math.min(window.innerWidth - 24, window.innerHeight - 88);   // 底部留 64 给控制条
+    var scale = Math.max(1, Math.floor(avail / screen.size));
+    var px = scale * screen.size;
+    if (cv.width !== px) {
+      cv.width = px; cv.height = px;
+      cv.style.width = px + 'px'; cv.style.height = px + 'px';
+    }
+    // QR 图自带 4 模块静区（白边），整屏铺一遍白底是纯浪费：
+    // 4K 窗口下那是 800 万个像素的填充，每帧一次。
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(screen.canvas, 0, 0, px, px);
+  }
+
+  function drawScreen(p) { paint(composeScreen(p)); }
+
+  function blank() {
+    cv.width = cv.height = 420;
+    cv.style.width = cv.style.height = '420px';
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, 420, 420);
+  }
+
+  // 每屏字节数：chunk 字符 → 约 2/3 字节，× 通道数
+  function bytesPerScreen() { return Math.floor(st.chunk * 2 / 3) * st.ch; }
+
+  // 实测换屏节奏：只算最近 3 秒，自动播放和滚轮手动切都记在里面
+  var beat = [];
+  function markSwitch() {
+    var now = performance.now();
+    beat.push(now);
+    while (beat.length > 24) { beat.shift(); }
+    while (beat.length && now - beat[0] > 3000) { beat.shift(); }
+  }
+  function actualRate() {
+    var now = performance.now();
+    while (beat.length && now - beat[0] > 3000) { beat.shift(); }
+    if (beat.length < 2) { return 0; }
+    var dt = (beat[beat.length - 1] - beat[0]) / 1000;
+    return dt > 0 ? (beat.length - 1) / dt : 0;
+  }
+
+  // ---------- 播放 ----------
+  function tick() {
+    if (!st.playing) { return; }
+    var p = st.idx;
+    try { drawScreen(p); } catch (e) { warn(String(e.message || e)); pause(); return; }
+    st.idx = (st.idx + 1) % screens();
+    markSwitch();
+    updateBar(p);
+  }
+
+  // 跳到第 p 屏（负数/越界自动绕回）。每屏自带帧头，跳过去就能单独发。
+  function seek(p) {
+    if (!st.total) { return; }
+    var n = screens();
+    p = ((p % n) + n) % n;
+    // st.idx 的语义是「下一屏」，所以这里存 p+1，current() 才对得上
+    st.idx = (p + 1) % n;
+    try { drawScreen(p); } catch (e) { warn(String(e.message || e)); }
+    markSwitch();
+    showBar();
+    updateBar(p);
+  }
+
+  function current() {
+    return ((st.idx - 1) % screens() + screens()) % screens();
+  }
+
+  function play() {
+    if (!st.total) { return; }
+    if (T.on) { stopTest(); }
+    st.playing = true;
+    $('btnPlay').textContent = '暂停';
+    if (st.timer) { clearInterval(st.timer); }
+    st.timer = setInterval(tick, Math.round(1000 / st.fps));
+    tick();
+  }
+
+  function pause() {
+    var was = st.playing;
+    st.playing = false;
+    if (st.timer) { clearInterval(st.timer); st.timer = null; }
+    $('btnPlay').textContent = was ? '继续' : '开始';
+    updateBar(current());
+  }
+
+  // ---------- 测速模式 ----------
+  // WNT | pass2 | stage1 | total3 | seq3 | fps2 | 数字填充
+  // 所有档位用同一长度载荷 → QR 尺寸恒定，量的是「通道能吃多快」而不是「图案多难认」。
+  var T = {
+    on: false, pass: 0, stage: 0, seq: 0, timer: null, chunk: 2800,
+    ladder: [{ fps: 2, dur: 4 }, { fps: 3, dur: 4 }, { fps: 4, dur: 4 }, { fps: 5, dur: 4 },
+             { fps: 6, dur: 3 }, { fps: 8, dur: 3 }]
+  };
+
+  function testText(pass, stageIdx, total, seq, fps) {
+    var head = 'WNT' + hex(pass % 256, 2) + hex(stageIdx, 1) + hex(total, 3)
+             + hex(seq, 3) + hex(fps, 2);
+    var n = T.chunk - head.length, pad = '';
+    var s = ((pass * 7919 + stageIdx * 131 + seq * 17 + 1) >>> 0);
+    for (var i = 0; i < n; i++) {
+      s = (s * 1103515245 + 12345) >>> 0;
+      pad += String.fromCharCode(48 + ((s >>> 16) % 10));
+    }
+    return head + pad;
+  }
+
+  function testStageFrames(stageIdx) { var s = T.ladder[stageIdx]; return s.fps * s.dur; }
+
+  // 测速时三个通道装同一屏的三个序号，好让接收端按屏统计
+  function drawTest() {
+    var s = T.ladder[T.stage], total = testStageFrames(T.stage);
+    var parts = [], k;
+    for (k = 0; k < st.ch; k++) {
+      var seq = T.seq + k < total ? T.seq + k : T.seq;
+      parts.push(moduleFor(testText(T.pass, T.stage, total, seq, s.fps)));
+    }
+    var size = parts[0].size;
+    var draw = [parts[0], parts[1], parts[2]];
+    if (st.ch === 1) { draw = [parts[0], parts[0], parts[0]]; }
+    var img = new ImageData(size, size), d = img.data, i, c;
+    for (i = 0; i < d.length; i += 4) { d[i] = d[i + 1] = d[i + 2] = 255; d[i + 3] = 255; }
+    for (c = 0; c < draw.length; c++) {
+      var m = draw[c].mask;
+      for (i = 0; i < m.length; i++) { if (m[i]) { d[i * 4 + c] = 0; } }
+    }
+    var cvs = document.createElement('canvas');
+    cvs.width = size; cvs.height = size;
+    cvs.getContext('2d').putImageData(img, 0, 0);
+    paint({ canvas: cvs, size: size });
+  }
+
+  function testTick() {
+    if (!T.on) { return; }
+    var s = T.ladder[T.stage], total = testStageFrames(T.stage);
+    try { drawTest(); } catch (e) { warn(String(e.message || e)); stopTest(); return; }
+    $('status').textContent = '测速 ' + (T.stage + 1) + '/' + T.ladder.length + '　·　'
+      + s.fps + ' FPS　·　' + (T.seq + 1) + '/' + total + '　·　第 ' + (T.pass + 1) + ' 轮'
+      + '　·　' + Math.round(Math.floor(T.chunk * 2 / 3) * st.ch * s.fps / 1024) + ' KB/s';
+    $('prog').style.width = ((T.seq + 1) / total * 100).toFixed(1) + '%';
+    T.seq++;
+    if (T.seq >= total) {
+      T.seq = 0; T.stage++;
+      if (T.stage >= T.ladder.length) { T.stage = 0; T.pass++; }
+      rescheduleTest();
+    }
+  }
+
+  function rescheduleTest() {
+    if (T.timer) { clearInterval(T.timer); }
+    T.timer = setInterval(testTick, Math.round(1000 / T.ladder[T.stage].fps));
+  }
+
+  function startTest() {
+    pause();
+    T.chunk = parseInt($('density').value, 10);
+    T.chunk -= T.chunk % 3;
+    st.chunk = T.chunk;
+    st.ch = parseInt($('mode').value, 10);
+    T.on = true; T.pass = 0; T.stage = 0; T.seq = 0;
+    warn('');
+    $('btnTest').textContent = '退出测速';
+    rescheduleTest();
+    testTick();
+  }
+
+  function stopTest() {
+    if (!T.on && !T.timer) { return; }
+    T.on = false;
+    if (T.timer) { clearInterval(T.timer); T.timer = null; }
+    $('btnTest').textContent = '测速';
+    T.pass = 0; T.stage = 0; T.seq = 0;
+    $('prog').style.width = '0%';
+    if (st.total) {
+      try { drawScreen(0); } catch (e) { warn(String(e.message || e)); }
+      $('status').textContent = screens() + ' 屏　·　' + st.size + ' 字节';
+    } else {
+      blank();
+      $('status').textContent = '';
+    }
+  }
+
+  // ---------- 载入文件 ----------
+  function loadBytes(bytes, name) {
+    pause();
+    stopTest();
+    st.cache = {};
+    st.cacheCount = 0;
+    st.idx = 0;
+    warn('');
+    st.name = name || 'data.bin';
+    st.size = bytes.length;
+    st.crc = crc32(bytes);
+    st.chunk = parseInt($('density').value, 10);
+    st.chunk -= st.chunk % 3;        // base44 三字符一组，帧长必须是 3 的倍数
+    st.ch = parseInt($('mode').value, 10);
+    // 字节数补成偶数再编码：base44 是「2 字节 → 3 字符」，奇数长度会让最后一组只剩 2 字符，
+    // 而帧尾补白会把这一组撑成 3 字符，解码时多算一位、把最后一个字节改坏。
+    // 多出来的补零字节由帧头的 size 截断掉，不影响内容。
+    var even = bytes.length % 2 ? (function () {
+      var b = new Uint8Array(bytes.length + 1);
+      b.set(bytes);
+      return b;
+    })() : bytes;
+    st.b44 = b44enc(even);
+    st.total = Math.max(1, Math.ceil(st.b44.length / st.chunk));
+    beat.length = 0;
+
+    // 先按 ver=00 探一次拿到版本；换掉版本号后长度不变，尺寸也就不变
+    st.ver = 0;
+    var shrunk = false;
+    while (st.chunk > 300) {
+      try { st.ver = moduleFor(frameText(1)).version; break; }
+      catch (e2) {
+        var why = String((e2 && (e2.message || e2)) || e2);
+        if (why.indexOf('code length overflow') < 0) { warn('编码失败：' + why); break; }
+        shrunk = true;
+        st.chunk = Math.max(300, Math.floor(st.chunk * 0.85 / 3) * 3);
+        st.total = Math.max(1, Math.ceil(st.b44.length / st.chunk));
+        st.cache = {}; st.cacheCount = 0;
+      }
+    }
+    try {
+      var f0 = moduleFor(frameText(1));
+      st.ver = f0.version;
+      var avail = Math.min(window.innerWidth - 24, window.innerHeight - 88);   // 底部留 64 给控制条
+      if (Math.floor(avail / f0.size) < 3) {
+        warn('窗口偏小：一个模块不到 3 像素，彩色模式下容易糊掉。\n'
+          + '按「全屏」，或把密度降一档，或切到「灰度 ×1」。');
+      }
+    } catch (e) { warn(String(e.message || e)); }
+
+    if (shrunk) { warn('这一屏装不下，已自动降到 ' + st.chunk + ' 字符/帧。'); }
+    // 整份文件排进编码队列：Worker 在后台并行编，播放时直接命中缓存
+    if (!POOL.ok) { initPool(); }
+    requestAll();
+    $('btnPlay').disabled = false;
+    $('btnPlay').textContent = '开始';
+    hideHint();
+    try { drawScreen(0); } catch (e) { warn(String(e.message || e)); }
+    st.idx = 1 % screens();
+    updateBar(0);
+    showBar();
+    return st.total;
+  }
+
+  function loadFile(file) {
+    pause();
+    st.cache = {};
+    st.idx = 0;
+    warn('');
+    if (!file) { return; }
+    if (file.size > 8 * 1024 * 1024) {
+      warn('文件 ' + (file.size / 1048576).toFixed(1) + ' MB，走屏幕传会很慢。'
+        + '\n建议先压缩，或只传关键部分。');
+    }
+    var fr = new FileReader();
+    fr.onload = function () { loadBytes(new Uint8Array(fr.result), file.name); };
+    fr.readAsArrayBuffer(file);
+  }
+
+  // 启动自检：库没加载成功时，把能判断的都摆出来（隔离机上不好开控制台）
+  var EXPECT_SIZE = '__EXPECT_SIZE__'.replace(/\s+$/, '');
+  if (typeof __QRCODE__ !== 'function') {
+    warn('编码库没有加载成功，页面没法工作。\n'
+      + '  __QRCODE__ 类型：' + (typeof __QRCODE__)
+      + '　模块导出：' + (window.__LIBOUT__ || '无')
+      + '　初始化异常：' + (window.__LIBERR__ || '无')
+      + '\n  AMD 状态：window.define=' + (typeof window.define)
+      + '　window.qrcode=' + (typeof window.qrcode)
+      + '\n  UA：' + navigator.userAgent
+      + '\n本文件应为 ' + EXPECT_SIZE + ' 字节；请核对大小（被截断就重新拷一份完整的过来）。');
+  } else {
+    try {
+      var probeQr = __QRCODE__(1, 'L');
+      probeQr.addData('AIRSCAN', 'Alphanumeric');
+      probeQr.make();
+      if (probeQr.getModuleCount() !== 21) {
+        warn('编码库能调用但结果不对（v1 应为 21 模块，实际 ' + probeQr.getModuleCount()
+          + '）。文件可能损坏，请重新拷贝。');
+      }
+    } catch (e) {
+      warn('编码库自检失败：' + ((e && (e.message || e)) || e) + '。文件可能损坏，请重新拷贝。');
+    }
+  }
+
+  // 供自检 / 自动化测试用（UI 之外唯一入口）
+  window.Wink2D = {
+    version: 'wink-2d/4',
+    loadBytes: loadBytes,
+    frames: function () { return st.total; },
+    channels: function () { return st.ch; },
+    screens: screens,
+    pool: function () { return { ok: POOL.ok, n: POOL.ws.length, done: st.encDone, total: st.encTotal }; },
+    meta: function () {
+      return { total: st.total, chunk: st.chunk, crc: st.crc, size: st.size, name: st.name,
+               channels: st.ch, bytesPerScreen: bytesPerScreen(), screens: screens() };
+    },
+    // f: 0 = 文件名帧，1..total = 数据帧
+    frameText: frameText,
+    metaText: function () { return frameText(0); },
+    screenFrames: function (p) {
+      var out = [];
+      for (var k = 0; k < st.ch; k++) {
+        var f = p * st.ch + k;
+        if (f < totalFrames()) { out.push(f); }
+      }
+      return out;
+    },
+    frameInfo: function (f) {
+      var m = moduleFor(frameText(f));
+      return { version: m.version, modules: m.size, sym: m.sym };
+    },
+    renderScreen: function (p) { drawScreen(p); },
+    currentScreen: current,
+    seekScreen: function (p) { pause(); seek(p); },
+    playing: function () { return st.playing; },
+    barShown: function () { return $('bar').classList.contains('show'); },
+    renderFrame: function (f) { drawScreen(Math.floor(f / st.ch)); },
+    play: play,
+    pause: pause,
+    speedTest: {
+      start: startTest,
+      stop: stopTest,
+      running: function () { return T.on; },
+      ladder: function () { return T.ladder; },
+      stageFrames: testStageFrames,
+      text: testText,
+      chunk: function () { return T.chunk; }
+    }
+  };
+
+  // ---------- 控制条：浮出 / 自动隐藏 ----------
+  function updateBar(p) {
+    if (p === undefined) { p = current(); }
+    var n = screens(), pct = n ? ((p + 1) / n * 100) : 0;
+    $('prog').style.width = pct.toFixed(2) + '%';
+    var r = actualRate(), kbs = r * bytesPerScreen() / 1024;
+    $('status').textContent = (p + 1) + '/' + n + ' 屏'
+      + '　·　' + r.toFixed(1) + ' 屏/秒'
+      + '　·　' + kbs.toFixed(1) + ' KB/s'
+      + (st.encTotal && st.encDone < st.encTotal
+          ? '　·　编码 ' + Math.min(st.encDone, st.encTotal) + '/' + st.encTotal
+          : '')
+      + '　·　设定 ' + st.fps + ' FPS'
+      + (st.playing ? '' : '　·　暂停');
+  }
+
+  var barTimer = null, hoverBar = false;
+  function showBar() {
+    $('bar').classList.add('show');
+    if (barTimer) { clearTimeout(barTimer); }
+    barTimer = setTimeout(function () {
+      if (!hoverBar && !st.seeking) { $('bar').classList.remove('show'); }
+    }, 2000);
+  }
+  function hideHint() { $('hint').classList.add('off'); }
+  setTimeout(hideHint, 5000);
+
+  // 控制条可见时每 250ms 刷一次，滚轮一点点滚也能看出速率
+  setInterval(function () {
+    if ($('bar').classList.contains('show')) { updateBar(); }
+  }, 250);
+
+  $('bar').addEventListener('mouseenter', function () { hoverBar = true; showBar(); });
+  $('bar').addEventListener('mouseleave', function () { hoverBar = false; showBar(); });
+  window.addEventListener('mousemove', showBar);
+
+  // 进度条：点哪儿跳哪儿，按住拖动连续跳
+  var track = $('track');
+  function seekFromEvent(e) {
+    var r = track.getBoundingClientRect();
+    var n = screens();
+    if (!n) { return; }
+    var ratio = Math.min(0.9999, Math.max(0, (e.clientX - r.left) / r.width));
+    pause();
+    seek(Math.floor(ratio * n));
+  }
+  track.addEventListener('pointerdown', function (e) {
+    st.seeking = true;
+    try { track.setPointerCapture(e.pointerId); } catch (err) {}
+    seekFromEvent(e);
+    e.preventDefault();
+  });
+  track.addEventListener('pointermove', function (e) {
+    if (st.seeking) { seekFromEvent(e); }
+  });
+  track.addEventListener('pointerup', function (e) {
+    st.seeking = false;
+    try { track.releasePointerCapture(e.pointerId); } catch (err) {}
+  });
+  track.addEventListener('pointercancel', function () { st.seeking = false; });
+
+  // 点击画面：开始 / 暂停
+  cv.addEventListener('click', function () {
+    if (!st.total) { return; }
+    hideHint();
+    if (st.playing) { pause(); } else { play(); }
+    showBar();
+  });
+
+  // 滚轮：前后换一屏（同时暂停，方便停在某一屏）
+  window.addEventListener('wheel', function (e) {
+    if (!st.total) { return; }
+    e.preventDefault();
+    pause();
+    seek(current() + (e.deltaY > 0 ? 1 : -1));
+  }, { passive: false });
+
+  // 键盘（顺手，不影响鼠标流）
+  window.addEventListener('keydown', function (e) {
+    if (!st.total) { return; }
+    if (e.key === ' ') { e.preventDefault(); if (st.playing) { pause(); } else { play(); } showBar(); }
+    else if (e.key === 'ArrowRight' || e.key === 'ArrowDown') { e.preventDefault(); pause(); seek(current() + 1); }
+    else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') { e.preventDefault(); pause(); seek(current() - 1); }
+    else if (e.key === 'f' || e.key === 'F') { $('btnFull').click(); }
+  });
+
+  // ---------- 事件 ----------
+  $('file').onchange = function () { loadFile(this.files && this.files[0]); };
+  $('btnPlay').onclick = function () { if (st.playing) { pause(); } else { play(); } };
+  $('btnTest').onclick = function () { if (T.on) { stopTest(); } else { startTest(); } };
+  $('btnFull').onclick = function () {
+    if (document.fullscreenElement) { document.exitFullscreen(); }
+    else if (document.documentElement.requestFullscreen) { document.documentElement.requestFullscreen(); }
+  };
+  $('fps').onchange = function () {
+    st.fps = parseInt(this.value, 10);
+    if (st.playing) { play(); }
+  };
+  $('density').onchange = function () {
+    if (T.on) { stopTest(); startTest(); return; }
+    if (st.size) { loadFile($('file').files && $('file').files[0]); }
+  };
+  $('mode').onchange = function () {
+    st.ch = parseInt(this.value, 10);
+    st.cache = {};
+    st.cacheCount = 0;
+    if (T.on) { stopTest(); startTest(); return; }
+    if (st.size) { loadFile($('file').files && $('file').files[0]); }
+  };
+  window.addEventListener('resize', function () {
+    if (T.on) { try { drawTest(); } catch (e) {} return; }
+    if (st.total) {
+      try { drawScreen(st.playing ? (st.idx + screens() - 1) % screens() : 0); } catch (e) {}
+    }
+  });
+
+  document.addEventListener('dragover', function (e) {
+    e.preventDefault();
+    $('hint').textContent = '松手即载入';
+    $('hint').classList.remove('off');
+  });
+  document.addEventListener('drop', function (e) {
+    e.preventDefault();
+    if (e.dataTransfer.files && e.dataTransfer.files[0]) { loadFile(e.dataTransfer.files[0]); }
+  });
+})();
+</script>
+</body>
+</html>

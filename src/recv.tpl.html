@@ -1,0 +1,964 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>接收端</title>
+<style>
+  body { margin: 0; padding: 12px; background: #f7f8fa; color: #111; max-width: 900px;
+         font: 13px/1.6 system-ui, "Microsoft YaHei", sans-serif; }
+  #bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  button { padding: 6px 12px; border: 0; border-radius: 6px; background: #2563eb; color: #fff;
+           font: inherit; font-weight: 600; cursor: pointer; }
+  button:disabled { background: #c3ccdb; cursor: default; }
+  button.plain { background: #eef1f6; color: #1f2937; font-weight: 500; }
+  #preview { display: block; margin-top: 10px; background: #000; border-radius: 8px; max-width: 100%; }
+  .meter { height: 4px; margin-top: 10px; background: #e5e8ee; border-radius: 2px; overflow: hidden; }
+  .meter > i { display: block; height: 100%; width: 0; background: #16a34a; }
+  #grid { display: grid; gap: 2px; margin-top: 8px; }
+  #grid i { display: block; height: 8px; border-radius: 1px; background: #e2e7f0; }
+  #grid i.ok { background: #16a34a; }
+  #stat { margin-top: 8px; color: #444; font: 12px/1.6 ui-monospace, Consolas, monospace;
+          white-space: pre-wrap; }
+  #speed { display: none; margin-top: 12px; }
+  #speed table { border-collapse: collapse; width: 100%;
+                 font: 12px/1.5 ui-monospace, Consolas, monospace; }
+  #speed th, #speed td { padding: 3px 8px; text-align: right; border-bottom: 1px solid #eceff4; }
+  #speed th:first-child, #speed td:first-child { text-align: left; }
+  #speed th { color: #666; font-weight: 500; }
+  #speed tr.ok td { color: #15803d; }
+  #speed tr.bad td { color: #b91c1c; }
+  #speed tr.dim td { color: #9aa3b2; }
+  #verdict { font-weight: 600; margin-bottom: 6px; }
+  #note { margin-top: 6px; color: #777; font-size: 12px; white-space: pre-wrap; }
+  #done { display: none; margin-top: 12px; padding: 8px 10px; background: #e9f8f0;
+          border-radius: 6px; }
+  #err { display: none; margin-top: 10px; padding: 8px 10px; background: #fdeaea;
+         border-radius: 6px; white-space: pre-wrap; }
+  a { color: #2563eb; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <button id="btnStart">开始采集</button>
+  <button id="btnCam" class="plain">摄像头</button>
+  <button id="btnStop" class="plain" disabled>停止</button>
+  <button id="btnRegion" class="plain">框选区域</button>
+  <button id="btnFull" class="plain" disabled>全屏扫描</button>
+  <span id="roiInfo"></span>
+</div>
+
+<video id="video" playsinline muted style="display:none"></video>
+<canvas id="preview" width="640" height="360"></canvas>
+
+<div class="meter"><i id="prog"></i></div>
+<div id="grid"></div>
+<div id="stat"></div>
+
+<div id="speed">
+  <div id="verdict"></div>
+  <table><thead><tr><th>档位</th><th>收到/应有</th><th>收全率</th><th></th></tr></thead>
+    <tbody id="speedRows"></tbody></table>
+  <div id="note"></div>
+</div>
+
+<div id="done"></div>
+<div id="err"></div>
+<script>
+var __JSQR__;
+
+(function () {
+  'use strict';
+  var $ = function (id) { return document.getElementById(id); };
+
+  // 构建时会被替换成 false；直接打开模板文件时它是 true
+  var __TEMPLATE__ = true;
+  if (__TEMPLATE__) {
+    err('这是源码模板（src/recv.tpl.html），不能直接运行。\n'
+      + '请通过 receiver/serve.py 打开 receiver/recv.html');
+    return;
+  }
+
+  var video = $('video'), pv = $('preview'), pctx = pv.getContext('2d');
+  var cap = document.createElement('canvas'), cctx = cap.getContext('2d', { willReadFrequently: true });
+
+  var HEAD = 33;      // WNK/WNM + idx4 + total4 + ver2 + size8 + crc8 + fcrc4
+
+  var st = {
+    running: false, stream: null, chunks: {}, total: 0, crc: 0, size: 0, name: '',
+    got: 0, tries: 0, hits: 0, misses: 0, dup: 0, bad: 0, badM: 0, badF: 0, badV: 0, charsGot: 0, t0: 0,
+    lastText: '', finished: false, lastProc: 0, ms: 0, msN: 0, beat: [], samp: [], scr: [],
+    // 一个文件 = (总帧数, 字节数, CRC)；收完的记进 doneGen，避免同一个文件重复生成链接
+    gen: '', doneGen: {}, doneList: []
+  };
+
+  var CRC_TABLE = (function () {
+    var t = new Uint32Array(256);
+    for (var n = 0; n < 256; n++) {
+      var c = n;
+      for (var k = 0; k < 8; k++) { c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1); }
+      t[n] = c >>> 0;
+    }
+    return t;
+  })();
+
+  function crc32(bytes) {
+    var c = 0xFFFFFFFF;
+    for (var i = 0; i < bytes.length; i++) { c = CRC_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8); }
+    return (c ^ 0xFFFFFFFF) >>> 0;
+  }
+  function hex(n, w) { var s = (n >>> 0).toString(16); while (s.length < w) { s = '0' + s; } return s.toUpperCase(); }
+  function hx(s, at, w) { return parseInt(s.substr(at, w), 16); }
+  function err(msg) { var e = $('err'); e.style.display = msg ? 'block' : 'none'; e.textContent = msg || ''; }
+
+  // ---------- base44 ----------
+  var B44 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ$%*+-./:';
+  var B44_IDX = (function () {
+    var m = {}, i;
+    for (i = 0; i < B44.length; i++) { m[B44.charAt(i)] = i; }
+    return m;
+  })();
+
+  function b44dec(str) {
+    var out = new Uint8Array(Math.ceil(str.length * 2 / 3) + 2), o = 0, i = 0, v, c0, c1, c2;
+    if (str.length % 3 === 1) { throw new Error('负荷长度不是 3 的倍数（发送端帧长没对齐）'); }
+    while (i < str.length) {
+      c0 = B44_IDX[str.charAt(i)];
+      c1 = B44_IDX[str.charAt(i + 1)];
+      if (c0 === undefined || c1 === undefined) { throw new Error('负荷含非法字符'); }
+      if (i + 2 < str.length) {
+        c2 = B44_IDX[str.charAt(i + 2)];
+        if (c2 === undefined) { throw new Error('负荷含非法字符'); }
+        v = c0 * 1936 + c1 * 44 + c2;
+        if (v > 0xFFFF) { throw new Error('负荷编码越界'); }
+        out[o++] = (v >> 8) & 0xFF;
+        out[o++] = v & 0xFF;
+        i += 3;
+      } else {
+        v = c0 * 44 + c1;
+        if (v > 0xFF) { throw new Error('负荷编码越界'); }
+        out[o++] = v;
+        i += 2;
+      }
+    }
+    return out.subarray(0, o);
+  }
+
+  function utf8dec(bytes) {
+    var out = '', i = 0, c, c2, c3, d4, cp;
+    while (i < bytes.length) {
+      c = bytes[i++];
+      if (c < 0x80) { out += String.fromCharCode(c); }
+      else if (c < 0xE0) { out += String.fromCharCode(((c & 0x1F) << 6) | (bytes[i++] & 0x3F)); }
+      else if (c < 0xF0) {
+        c2 = bytes[i++]; c3 = bytes[i++];
+        out += String.fromCharCode(((c & 0x0F) << 12) | ((c2 & 0x3F) << 6) | (c3 & 0x3F));
+      } else {
+        c2 = bytes[i++]; c3 = bytes[i++]; d4 = bytes[i++];
+        cp = ((c & 0x07) << 18) | ((c2 & 0x3F) << 12) | ((c3 & 0x3F) << 6) | (d4 & 0x3F);
+        cp -= 0x10000;
+        out += String.fromCharCode(0xD800 + (cp >> 10), 0xDC00 + (cp & 0x3FF));
+      }
+    }
+    return out;
+  }
+
+  function sanitize(name) {
+    var s = String(name || '').replace(/[\\/:*?"<>|\x00-\x1F]/g, '_').replace(/^[. ]+/, '');
+    if (!s) { s = 'received.bin'; }
+    if (s.length > 120) { s = s.slice(0, 120); }
+    return s;
+  }
+
+  // ---------- 采集 ----------
+  function startWith(stream) {
+    stop();
+    st.running = true; st.stream = stream; st.t0 = Date.now();
+    video.srcObject = stream;
+    video.play();
+    $('btnStop').disabled = false;
+    $('btnStart').disabled = true; $('btnCam').disabled = true;
+
+    err('');
+    requestAnimationFrame(loop);
+  }
+
+  function stop() {
+    st.running = false;
+    st.doneGen = {}; st.doneList = []; renderDone();
+    selA = selB = null; selecting = false;
+    $('btnRegion').classList.remove('on');
+    if (st.stream) { st.stream.getTracks().forEach(function (t) { t.stop(); }); st.stream = null; }
+    video.srcObject = null;
+    $('btnStop').disabled = true;
+    $('btnStart').disabled = false; $('btnCam').disabled = false;
+  }
+
+  $('btnStart').onclick = function () {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+      return err('这个浏览器不支持屏幕采集（getDisplayMedia）。请用 Edge/Chrome，或点「改用摄像头」。');
+    }
+    navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 60 } }, audio: false })
+      .then(function (s) { startWith(s); })
+      .catch(function (e) { err('屏幕采集失败：' + e.message + '\n提示：远程桌面里要选「整个屏幕」或发送端那个窗口。'); });
+  };
+
+  $('btnCam').onclick = function () {
+    navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 1920 }, height: { ideal: 1080 }, facingMode: 'environment' }, audio: false })
+      .then(function (s) { startWith(s); })
+      .catch(function (e) { err('摄像头打不开：' + e.message); });
+  };
+
+  $('btnStop').onclick = stop;
+
+  // ---------- 解码：灰度 / 三通道，多线程 ----------
+  // 发送端可以把一屏三个帧分别画进 R / G / B。每个通道单独看就是一张普通的单码图，
+  // 所以不用改解码器，只要把某个通道拆成灰度图再交给 jsQR。
+  // 三次解码丢进 Worker 并行做，主线程只管采样：鼠标拉着进度条狂滚时也能跟上。
+  var MODE = 0;            // 0 = 没确定，1 = 灰度单码，3 = 彩色三通道
+  var modeMiss = 0;
+
+  function isOurs(txt) {
+    if (!txt || txt.length < 14) { return false; }
+    var h = txt.slice(0, 3);
+    return h === 'WNK' || h === 'WNM' || h === 'WNT';
+  }
+
+  function dec(buf, w, h) {
+    var r = null;
+    try { r = __JSQR__(buf, w, h, { inversionAttempts: 'dontInvert' }); } catch (e) { r = null; }
+    LOC = r ? (r.location || null) : null;
+    return r && isOurs(r.data) ? r.data : null;
+  }
+
+  // 看图里有不有颜色：灰度模式下 R=G=B，扫一遍抽样像素就够
+  function colorish(img) {
+    var d = img.data, n = d.length / 4, step = Math.max(1, Math.floor(n / 4000)), i, o;
+    for (i = 0; i < n; i += step) {
+      o = i * 4;
+      if (Math.abs(d[o] - d[o + 1]) > 24 || Math.abs(d[o + 1] - d[o + 2]) > 24) { return true; }
+    }
+    return false;
+  }
+
+  // 画面指纹：抽一格 64×64 的样本算个哈希。屏幕没变就不必再解一遍。
+  // 指纹的作用域就是传进来的这块图：锁定区域之后 img 是裁剪后的 ROI，
+  // 所以指纹也只反映锁定区域的变化，不受屏幕其它地方（鼠标、时钟、别的窗口）干扰。
+  var FING = 64;
+  function fingerprint(img, w, h) {
+    var d = img.data, sx = Math.max(1, Math.floor(w / FING)), sy = Math.max(1, Math.floor(h / FING));
+    var hsh = 2166136261, x, y, o;
+    for (y = 0; y < h; y += sy) {
+      for (x = 0; x < w; x += sx) {
+        o = (y * w + x) * 4;
+        hsh = ((hsh ^ (d[o] << 16) ^ (d[o + 1] << 8) ^ d[o + 2]) * 16777619) >>> 0;
+      }
+    }
+    return hsh;
+  }
+
+  var doneHash = 0;        // 上一块「整屏都解出来了」的画面指纹
+  var sentHash = 0;        // 上一次「已经交出去解」的画面指纹
+  // 采样比解码快得多（每屏停留期间能采到好几次），同一屏重复提交会把 Worker 池占满、
+  // 让真正的下一屏排在后面，所以要在提交前就去重：指纹没变就这一次不提交。
+  var sentAt = 0;
+
+  // ---------- 感兴趣区域 ----------
+  // jsQR 每次都从整幅画面里找码：全屏 1920×1080 解一次要一两百毫秒。
+  // 屏幕位置是固定的，所以第一屏解出来后就把码的位置记住，之后只截这一小块去解，
+  // 像素少一个数量级，解码也就快一个数量级。位置变了（换了窗口、拖了位置）会自动重扫。
+  var ROI = null;             // {x, y, w, h}，视频像素坐标
+  var roiCandidate = null;    // 待确认的位置（连续两次一致才采用）
+  var roiMiss = 0;            // 锁定后连续解不出来的次数
+  var LOC = null;             // 最近一次成功解码的角点（当前帧坐标）
+
+  function locBox(loc, w, h) {
+    if (!loc) { return null; }
+    var ps = [loc.topLeftCorner, loc.topRightCorner, loc.bottomLeftCorner, loc.bottomRightCorner,
+              loc.topLeftFinderPattern, loc.topRightFinderPattern, loc.bottomLeftFinderPattern];
+    var x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9, i, q;
+    for (i = 0; i < ps.length; i++) {
+      q = ps[i];
+      if (!q) { continue; }
+      if (q.x < x0) { x0 = q.x; }
+      if (q.y < y0) { y0 = q.y; }
+      if (q.x > x1) { x1 = q.x; }
+      if (q.y > y1) { y1 = q.y; }
+    }
+    if (!(x1 > x0) || !(y1 > y0)) { return null; }
+    return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+  }
+
+  function clampRoi(r, w, h) {
+    var pad = Math.max(8, Math.round(Math.max(r.w, r.h) * 0.10));   // 留出静区
+    var x = Math.max(0, Math.floor(r.x - pad)), y = Math.max(0, Math.floor(r.y - pad));
+    var x2 = Math.min(w, Math.ceil(r.x + r.w + pad)), y2 = Math.min(h, Math.ceil(r.y + r.h + pad));
+    var ww = (x2 - x) & ~1, hh = (y2 - y) & ~1;
+    x -= x % 2; y -= y % 2;
+    if (ww < 40 || hh < 40) { return null; }
+    return { x: x, y: y, w: Math.min(ww, w - x), h: Math.min(hh, h - y) };
+  }
+
+  // box 是「当前这一帧」的坐标（可能已经是裁剪后的），offX/offY 是它在整屏里的偏移
+  function noteBox(box, offX, offY, vw, vh) {
+    if (!box || window.__NOROI__) { return; }
+    var cand = clampRoi({ x: box.x + offX, y: box.y + offY, w: box.w, h: box.h }, vw, vh);
+    if (!cand) { return; }
+    if (roiCandidate) {
+      var a = roiCandidate;
+      if (Math.abs(a.x - cand.x) <= 12 && Math.abs(a.y - cand.y) <= 12 &&
+          Math.abs(a.w - cand.w) <= 16 && Math.abs(a.h - cand.h) <= 16) {
+        ROI = cand; roiCandidate = null; roiMiss = 0; doneHash = 0;
+        grabShot(); drawPreview(); sync();     // 锁定后立刻改画「只显示这一块」
+        return;
+      }
+    }
+    roiCandidate = cand;
+  }
+
+  function clearRoi() {
+    ROI = null; roiCandidate = null; roiMiss = 0; doneHash = 0;
+    roiShot = null; roiShotT = 0;
+    sync();
+  }
+
+  function sync() {
+    var info = $('roiInfo');
+    $('btnFull').disabled = !ROI;
+    if (!ROI) { info.textContent = '整屏扫描'; return; }
+    info.textContent = '只解 ' + ROI.w + '×' + ROI.h + ' 那一块';
+  }
+
+  // ---------- Worker 池 ----------
+  // jsQR 的源码在页面里以纯文本存了一份（id=libjsqr），Worker 从它拼出来，页面不重复带一份代码。
+  var POOL = { ws: [], idle: [], queue: [], pending: {}, seq: 0, ok: false };
+  var LIBSRC = null, WURL = null;
+
+  function libSrc() {
+    if (LIBSRC === null || LIBSRC === undefined) {
+      var el = document.getElementById('libjsqr');
+      LIBSRC = el ? el.textContent : '';
+    }
+    return LIBSRC;
+  }
+
+  function workerCode() {
+    return 'var module = { exports: {} }, exports = module.exports, define;\n'
+      + libSrc()
+      + '\nvar __decode = (module.exports && (module.exports.default || module.exports)) || null;\n'
+      + 'self.postMessage({ ready: typeof __decode });\n'
+      + 'self.onmessage = function (e) {\n'
+      + '  var d = e.data, r = null;\n'
+      + '  try { r = __decode(new Uint8ClampedArray(d.buf), d.w, d.h,'
+      + ' { inversionAttempts: "dontInvert" }); } catch (err) { r = null; }\n'
+      + '  self.postMessage({ id: d.id, text: r ? r.data : null, loc: r ? (r.location || null) : null,'
+      + ' buf: d.buf }, [d.buf]);\n'
+      + '};\n';
+  }
+
+  function initPool() {
+    if (window.__NOWORKER__) { return; }        // 诊断用：强制走同步
+    try {
+      if (typeof Worker !== 'function' || !libSrc()) { return; }
+      WURL = URL.createObjectURL(new Blob([workerCode()], { type: 'text/javascript' }));
+      var hw = navigator.hardwareConcurrency || 4;
+      var n = Math.max(2, Math.min(4, hw - 1));
+      for (var i = 0; i < n; i++) {
+        var wk = new Worker(WURL);
+        wk.onmessage = workerDone;
+        wk.onerror = function (ev) {
+          POOL.ok = false;
+          window.__WERR__ = String((ev && (ev.message || ev.type)) || 'error');
+        };
+        POOL.ws.push(wk);
+        POOL.idle.push(wk);
+      }
+      POOL.ok = true;
+    } catch (e) { POOL.ok = false; window.__POOLERR__ = String(e && e.message || e); }
+  }
+
+  // 通道缓冲来回转手（transfer），不做多余的拷贝
+  var freeBufs = [];
+  function takeBuf(n) {
+    for (var i = 0; i < freeBufs.length; i++) {
+      if (freeBufs[i].byteLength === n) { return freeBufs.splice(i, 1)[0]; }
+    }
+    try { return new ArrayBuffer(n); } catch (e) { return null; }
+  }
+  function giveBuf(ab) { if (ab && freeBufs.length < 12) { freeBufs.push(ab); } }
+
+  function fillChannel(ab, img, c, w, h) {
+    var src = img.data, dst = new Uint8ClampedArray(ab), i, v;
+    for (i = 0; i < src.length; i += 4) {
+      v = src[i + c];
+      dst[i] = v; dst[i + 1] = v; dst[i + 2] = v; dst[i + 3] = 255;
+    }
+  }
+
+  function postDecode(ab, w, h, cb) {
+    var job = { id: ++POOL.seq, buf: ab, w: w, h: h, cb: cb };
+    POOL.pending[job.id] = job;
+    var wk = POOL.idle.pop();
+    if (!wk) { POOL.queue.push(job); return; }
+    wk.postMessage({ id: job.id, buf: ab, w: w, h: h }, [ab]);
+  }
+
+  function workerDone(e) {
+    var d = e.data;
+    if (d && d.ready !== undefined) { POOL.ready = d.ready; return; }
+    var job = POOL.pending[d.id];
+    delete POOL.pending[d.id];
+    POOL.idle.push(e.target);
+    if (job) {
+      giveBuf(d.buf);
+      try { job.cb(d.text, d.loc); } catch (err) {}
+    }
+    var next = POOL.queue.shift();
+    if (next) {
+      var wk = POOL.idle.pop();
+      if (wk) { wk.postMessage({ id: next.id, buf: next.buf, w: next.w, h: next.h }, [next.buf]); }
+      else { POOL.queue.unshift(next); }
+    }
+  }
+
+  // ---------- 同步兜底（Worker 用不了的时候）----------
+  var chBuf = null;
+  function channelGray(img, c, w, h) {
+    if (!chBuf || chBuf.w !== w || chBuf.h !== h) {
+      chBuf = { w: w, h: h, data: new Uint8ClampedArray(w * h * 4) };
+    }
+    var src = img.data, dst = chBuf.data, i, v;
+    for (i = 0; i < src.length; i += 4) {
+      v = src[i + c];
+      dst[i] = v; dst[i + 1] = v; dst[i + 2] = v; dst[i + 3] = 255;
+    }
+    return chBuf.data;
+  }
+
+  function readFrame(img, w, h) {
+    var out = [], seen = {}, i, t;
+    var fp = fingerprint(img, w, h);
+    if (fp === doneHash) { return out; }
+    if (!MODE) { MODE = colorish(img) ? 3 : 1; }
+    if (MODE === 1 && colorish(img)) { MODE = 3; }
+
+    if (MODE === 1) {
+      t = dec(channelGray(img, 0, w, h), w, h);
+      if (t) { out.push(t); modeMiss = 0; doneHash = fp; }
+      else if (++modeMiss > 40) { MODE = 0; modeMiss = 0; }
+      return out;
+    }
+
+    for (i = 0; i < 3; i++) {
+      t = dec(channelGray(img, i, w, h), w, h);
+      if (t && !seen[t]) { out.push(t); seen[t] = 1; }
+    }
+    if (out.length) {
+      modeMiss = 0;
+      if (out.length >= 3) { doneHash = fp; }
+      return out;
+    }
+    t = dec(img.data, w, h);
+    if (t) { out.push(t); modeMiss = 0; doneHash = fp; return out; }
+    if (++modeMiss > 40) { MODE = 0; modeMiss = 0; }
+    return out;
+  }
+
+  // ---------- 异步路径 ----------
+  var inflight = 0, MAXINFLIGHT = 3;
+
+  function readFrameAsync(img, w, h, fp, cb) {
+    var chs = MODE === 1 ? [0] : [0, 1, 2];
+    var got = [], seen = {}, remain = chs.length, t0 = performance.now();
+    inflight++;
+
+    function one(c) {
+      var ab = takeBuf(w * h * 4);
+      if (!ab) { done(null); return; }
+      fillChannel(ab, img, c, w, h);
+      postDecode(ab, w, h, function (text, loc) {
+        if (text && isOurs(text) && !seen[text]) {
+          seen[text] = 1; got.push(text);
+          if (!LOC) { LOC = loc; }
+        }
+        done(text);
+      });
+    }
+    function done() {
+      if (--remain > 0) { return; }
+      inflight--;
+      if (got.length) {
+        modeMiss = 0;
+        // 三个通道都解出来才记指纹；缺一格下次还会重试
+        if (got.length >= chs.length) { doneHash = fp; }
+      } else if (++modeMiss > 40) { MODE = 0; modeMiss = 0; }
+      cb(got, Math.round(performance.now() - t0));
+    }
+    for (var i = 0; i < chs.length; i++) { one(chs[i]); }
+  }
+
+  // ---------- 预览与手动框选 ----------
+  var selA = null, selB = null, selecting = false;
+
+  // 锁定后只留一张「锁定区域」的截图，页面上不再整幅转播：
+  // 少一次每帧的大图缩放，也不会因为预览刷新抢解码的时间。
+  var roiShot = null, roiShotT = 0;
+
+  function grabShot() {
+    if (!ROI || !video.videoWidth) { return; }
+    var c = document.createElement('canvas');
+    c.width = ROI.w; c.height = ROI.h;
+    try {
+      c.getContext('2d').drawImage(video, ROI.x, ROI.y, ROI.w, ROI.h, 0, 0, ROI.w, ROI.h);
+    } catch (e) { return; }
+    roiShot = c; roiShotT = Date.now();
+  }
+
+  function drawPreview() {
+    if (!video.videoWidth) { return; }
+
+    if (ROI) {                                  // 已锁定：只显示这一块
+      var pw = 480, ph = Math.round(480 * ROI.h / ROI.w);
+      if (pv.width !== pw || pv.height !== ph) { pv.width = pw; pv.height = ph; }
+      if (!roiShot || Date.now() - roiShotT > 3000) { grabShot(); }
+      pctx.fillStyle = '#0f172a';
+      pctx.fillRect(0, 0, pw, ph);
+      if (roiShot) { pctx.drawImage(roiShot, 0, 0, pw, ph); }
+
+      // 明确的取景标记：四角括号 + 顶部标签，一眼看出「只解这块」
+      var arm = Math.max(18, Math.round(Math.min(pw, ph) * 0.10));
+      var lw = Math.max(3, Math.round(pw / 120));
+      pctx.strokeStyle = '#22c55e';
+      pctx.lineWidth = lw;
+      pctx.beginPath();
+      pctx.moveTo(lw / 2, arm); pctx.lineTo(lw / 2, lw / 2); pctx.lineTo(arm, lw / 2);
+      pctx.moveTo(pw - arm, lw / 2); pctx.lineTo(pw - lw / 2, lw / 2); pctx.lineTo(pw - lw / 2, arm);
+      pctx.moveTo(lw / 2, ph - arm); pctx.lineTo(lw / 2, ph - lw / 2); pctx.lineTo(arm, ph - lw / 2);
+      pctx.moveTo(pw - arm, ph - lw / 2); pctx.lineTo(pw - lw / 2, ph - lw / 2); pctx.lineTo(pw - lw / 2, ph - arm);
+      pctx.stroke();
+
+      var tag = '已锁定 ' + ROI.w + '×' + ROI.h + ' · 只解这一块';
+      pctx.font = '600 ' + Math.max(12, Math.round(pw / 30)) + 'px system-ui, "Microsoft YaHei", sans-serif';
+      var tw = pctx.measureText(tag).width;
+      pctx.fillStyle = 'rgba(22,163,74,.92)';
+      pctx.fillRect(0, ph - 30, Math.min(pw, tw + 20), 30);
+      pctx.fillStyle = '#fff';
+      pctx.fillText(tag, 10, ph - 9);
+      return;                                   // 不再画整幅画面
+    }
+
+    var vw = video.videoWidth, vh = video.videoHeight;
+    var pw2 = 480, ph2 = Math.round(480 * vh / vw);
+    if (pv.width !== pw2 || pv.height !== ph2) { pv.width = pw2; pv.height = ph2; }
+    var k = pw2 / vw;
+    pctx.drawImage(video, 0, 0, pw2, ph2);
+    pctx.lineWidth = 2;
+    pctx.strokeStyle = '#2563eb';
+    if (selA && selB) {
+      pctx.setLineDash([6, 4]);
+      pctx.strokeStyle = '#e85d04';
+      pctx.strokeRect(Math.min(selA.x, selB.x) * k, Math.min(selA.y, selB.y) * k,
+                      Math.abs(selA.x - selB.x) * k, Math.abs(selA.y - selB.y) * k);
+      pctx.setLineDash([]);
+    }
+  }
+
+  function pvPoint(e) {
+    var r = pv.getBoundingClientRect();
+    return { x: (e.clientX - r.left) / r.width * video.videoWidth,
+             y: (e.clientY - r.top) / r.height * video.videoHeight };
+  }
+
+  pv.addEventListener('pointerdown', function (e) {
+    if (!video.videoWidth) { return; }
+    if (!$('btnRegion').classList.contains('on')) { return; }
+    selecting = true;
+    selA = pvPoint(e); selB = selA;
+    try { pv.setPointerCapture(e.pointerId); } catch (err) {}
+    e.preventDefault();
+  });
+  pv.addEventListener('pointermove', function (e) {
+    if (!selecting) { return; }
+    selB = pvPoint(e);
+    drawPreview();
+  });
+  pv.addEventListener('pointerup', function (e) {
+    if (!selecting) { return; }
+    selecting = false;
+    selB = pvPoint(e);
+    var r = { x: Math.min(selA.x, selB.x), y: Math.min(selA.y, selB.y),
+              w: Math.abs(selA.x - selB.x), h: Math.abs(selA.y - selB.y) };
+    selA = selB = null;
+    var c = clampRoi(r, video.videoWidth, video.videoHeight);
+    if (c) { ROI = c; roiCandidate = null; roiMiss = 0; doneHash = 0; grabShot(); drawPreview(); sync(); }
+    $('btnRegion').classList.remove('on');
+    drawPreview();
+  });
+
+  $('btnRegion').onclick = function () {
+    this.classList.toggle('on');
+    if (this.classList.contains('on')) { err('在预览图上拖一个框，框住二维码所在的区域。'); }
+    else { err(''); }
+  };
+  $('btnFull').onclick = function () { clearRoi(); drawPreview(); };
+
+  // 预览每 200ms 刷一次，锁定的框能看见
+  // 没锁定时低帧率转播（2 帧/秒）；锁定后只在截图过期时才重画
+  setInterval(function () {
+    if (!st.running) { return; }
+    if (ROI && roiShot && Date.now() - roiShotT < 3000) { return; }
+    drawPreview();
+  }, 500);
+
+  // ---------- 解码主循环 ----------
+  function loop(ts) {
+    if (!st.running) { return; }
+    requestAnimationFrame(loop);
+    // 上一批还没解完就先别取新帧（背压），否则内存飞涨、反而更慢
+    if (POOL.ok && inflight >= MAXINFLIGHT) { return; }
+    // 采样频率上限 = 显示器刷新率（rAF 本身就限制在 60/s），这里再挡一下别把主线程堵死。
+    // 采样便宜（只读锁定区域 + 一次稀疏指纹），贵的是解码，所以采样可以尽管快；
+    // 真正进解码队列的只有「指纹变了」的那些帧，见下面的 check。
+    if (ts - st.lastProc < (T.on ? 0 : 16)) { return; }
+    st.lastProc = ts;
+    if (!video.videoWidth) { return; }
+
+    var vw = video.videoWidth, vh = video.videoHeight;
+    // 锁定了区域就只截那一块：像素少一个数量级，jsQR 也就快一个数量级
+    var sx = 0, sy = 0, w = vw, h = vh;
+    if (ROI) { sx = ROI.x; sy = ROI.y; w = ROI.w; h = ROI.h; }
+    if (cap.width !== w || cap.height !== h) { cap.width = w; cap.height = h; }
+    cctx.drawImage(video, sx, sy, w, h, 0, 0, w, h);
+    var t1 = performance.now();
+    var img;
+    try { img = cctx.getImageData(0, 0, w, h); } catch (e) { return err('读取画面失败：' + e.message); }
+
+    // 画面还是上一块：直接跳过，省掉三次解码
+    var fp = fingerprint(img, w, h);
+    if (fp === doneHash) { return; }               // 这一屏已经整屏解出来了
+    if (fp === sentHash && ts - sentAt < 1200) { return; }   // 刚提交过同一屏，别重复提交
+    sentHash = fp; sentAt = ts;
+    if (!MODE) { MODE = colorish(img) ? 3 : 1; }
+    else if (MODE === 1 && colorish(img)) { MODE = 3; }
+
+    st.tries++;
+    st.samp.push(ts);
+    while (st.samp.length && ts - st.samp[0] > 3000) { st.samp.shift(); }
+    T.att++;
+    if (!T.attMark) { T.attMark = ts; }
+    else if (ts - T.attMark > 1000) {
+      T.attRate = T.att * 1000 / (ts - T.attMark); T.att = 0; T.attMark = ts;
+    }
+
+    function apply(texts, dt) {
+      st.ms += dt; st.msN++;
+      if (texts.length) {
+        st.hits++;                    // 这一次采样有收获（一屏最多三个帧）
+        roiMiss = 0;                  // 解出来了就清零，只有连续失败才判定「位置变了」
+        noteBox(locBox(LOC, w, h), sx, sy, vw, vh);
+        var g0 = st.got;
+        for (var ti = 0; ti < texts.length; ti++) {
+          handle(texts[ti], ti === 0 ? dt : 0);
+        }
+        // 只有这一屏带来了新帧才算「解析了一屏」，否则同一屏会被重复计数
+        if (st.got > g0) {
+          var nowScr = Date.now();
+          st.scr.push(nowScr);
+          while (st.scr.length && nowScr - st.scr[0] > 3000) { st.scr.shift(); }
+        } else {
+          // 采到的是上一屏的残影（采集帧率跟不上切换），这一屏等于白采：允许马上再采一次。
+          // 真静止的画面不会刷屏，因为「整屏已解出」会先把它挡掉。
+          sentHash = 0;
+        }
+      } else {
+        st.misses++;
+        sentHash = 0;                 // 这一屏没解出来：放开，下一个采样再试一次
+        // 锁着区域却连续解不出来：位置变了，放开重扫
+        if (ROI && ++roiMiss > 10) { clearRoi(); }
+        if (!ROI) { drawPreview(); }
+        render();
+      }
+    }
+
+    LOC = null;
+    if (POOL.ok) { readFrameAsync(img, w, h, fp, apply); return; }
+
+    var texts = [];
+    try { texts = readFrame(img, w, h); } catch (e) { texts = []; }
+    apply(texts, Math.round(performance.now() - t1));
+  }
+
+  // 与发送端同一算法，覆盖 idx + payload
+  function fcrc(idxHex, payload) {
+    var c = 0xFFFFFFFF, i, j, str = idxHex + payload;
+    for (i = 0; i < str.length; i++) {
+      c ^= str.charCodeAt(i) & 0xFF;
+      for (j = 0; j < 8; j++) { c = (c >>> 1) ^ (0xEDB88320 & -(c & 1)); }
+    }
+    return ((c ^ 0xFFFFFFFF) >>> 0) & 0xFFFF;
+  }
+
+  function handle(text, dt) {
+    if (text.slice(0, 3) === 'WNT') { handleTest(text); return; }
+    if (text.length <= HEAD) { return render(dt); }
+    var kind = text.slice(0, 3);
+    if (text === st.lastText) { st.dup++; }
+    st.lastText = text;
+
+    var idx = hx(text, 3, 4), total = hx(text, 7, 4), ver = hx(text, 11, 2);
+    var size = hx(text, 13, 8), crc = hx(text, 21, 8), f = hx(text, 29, 4);
+    var payload = text.slice(HEAD);
+    if (ver < 1 || ver > 40) { st.bad++; st.badV++; return render(dt); }
+
+    if (kind === 'WNM') {
+      // 元信息帧：文件名（可能含中文）
+      if (fcrc('0000', payload) !== f) { st.bad++; st.badM++; return render(dt); }
+      try { st.name = sanitize(utf8dec(b44dec(payload).subarray(0, size))); }
+      catch (e) { st.bad++; }
+      if (st.name && finishTimer) { clearTimeout(finishTimer); finishTimer = null; }
+      render(dt);
+      if (st.name && st.got >= st.total && !st.finished) { finish(); }
+      return;
+    }
+
+    // 帧级校验：不通过就当场丢掉，等这一帧下一轮重播（不污染已收好的其它帧）
+    if (fcrc(hex(idx, 4), payload) !== f) { st.bad++; st.badF++; return render(dt); }
+
+    var gk = total + '|' + size + '|' + crc;
+    if (st.doneGen[gk]) { return render(dt); }          // 这个文件刚收完，发送端还在播，跳过
+    if (st.gen && st.gen !== gk) {
+      // 发送端换文件了：不打断采集，只清空数据重新开始
+      if (st.got) { err(''); resetForNext(gk); }
+      else { st.gen = gk; }
+    }
+    if (!st.total) {
+      st.gen = gk;
+      st.total = total; st.crc = crc; st.size = size;
+      st.t0 = st.t0 || Date.now();
+      buildGrid();
+    }
+    if (st.chunks[idx] === undefined) {
+      st.chunks[idx] = payload;
+      st.got++;
+      st.charsGot += payload.length;
+      // 速率按最近 3 秒算（和发送端一致）：累计平均会把丢帧后等下一轮的时间摊进去，看着偏低
+      st.beat.push({ t: Date.now(), b: payload.length });
+    }
+    render(dt);
+    if (st.got >= st.total && !st.finished) { maybeFinish(); }
+  }
+
+  // 数据已经齐了：文件名帧还没到就等一小会儿（发送端每轮都会有它），再去掉也照常给结果
+  var finishTimer = null;
+  function maybeFinish() {
+    if (st.finished || !st.total || st.got < st.total) { return; }
+    if (st.name) { finish(); return; }
+    if (finishTimer) { return; }
+    finishTimer = setTimeout(function () { finishTimer = null; finish(); }, 1500);
+  }
+
+  // ---------- 测速模式 ----------
+  // 发送端按阶梯扫帧率，每帧头带 pass/stage/total/seq/fps。
+  // 用 (maxSeq - minSeq + 1) 作分母，中途开始看、中途走开都不会把窗口算错。
+  var T = { on: false, passes: {}, att: 0, attMark: 0, attRate: 0 };
+
+  function handleTest(text) {
+    if (text.length < 14) { return; }
+    var pass = hx(text, 3, 2), stage = hx(text, 5, 1), total = hx(text, 6, 3);
+    var seq = hx(text, 9, 3), fps = hx(text, 12, 2);
+    if (!(total > 0) || !(fps > 0)) { return; }
+
+    if (!T.on) {
+      T.on = true;
+      $('speed').style.display = 'block';
+      T.chunkLen = text.length;
+    }
+    var p = T.passes[pass] || (T.passes[pass] = { stages: {} });
+    var s = p.stages[stage] || (p.stages[stage] = { fps: fps, total: total, seen: {},
+                                                     n: 0, min: seq, max: seq });
+    s.fps = fps; s.total = total;
+    if (seq < s.min) { s.min = seq; }
+    if (seq > s.max) { s.max = seq; }
+    if (!s.seen[seq]) { s.seen[seq] = 1; s.n++; }
+    renderSpeed();
+  }
+
+  function renderSpeed() {
+    var keys = Object.keys(T.passes).map(Number).sort(function (a, b) { return a - b; });
+    if (!keys.length) { return; }
+    var p = T.passes[keys[keys.length - 1]];
+
+    var stages = Object.keys(p.stages).map(Number).sort(function (a, b) { return a - b; });
+    var rows = [], best = null, prevOk = true;
+    for (var i = 0; i < stages.length; i++) {
+      var k = stages[i], s = p.stages[k];
+      var expect = s.max - s.min + 1;
+      var ratio = expect > 0 ? s.n / expect : 0;
+      var small = expect < 6;
+      var ok = !small && ratio >= 0.95;
+      if (prevOk && ok) { best = s.fps; } else if (!small) { prevOk = false; }
+      rows.push({ stage: k, fps: s.fps, n: s.n, expect: expect, ratio: ratio, ok: ok, small: small });
+    }
+    if (best === null) {
+      $('verdict').textContent = '还没测出可用档位';
+    } else {
+      var per = Math.floor(((T.chunkLen || 0) - 14) * 2 / 3);
+      $('verdict').textContent = '上限 ' + best + ' FPS　·　' + (best * per / 1024).toFixed(1) + ' KB/s';
+    }
+
+    var html = '';
+    for (var j = 0; j < rows.length; j++) {
+      var r = rows[j];
+      var cls = r.small ? 'dim' : (r.ok ? 'ok' : 'bad');
+      html += '<tr class="' + cls + '"><td>' + r.fps + ' FPS</td><td>' + r.n + ' / ' + r.expect
+        + '</td><td>' + (r.small ? '-' : Math.round(r.ratio * 100) + '%')
+        + '</td><td>' + (r.small ? '样本少' : (r.ok ? '稳' : '跟不上')) + '</td></tr>';
+    }
+    $('speedRows').innerHTML = html;
+    $('note').textContent = '阈值 95%，样本少于 6 帧不下结论　·　本机解码 '
+      + (T.attRate ? T.attRate.toFixed(1) : '…') + ' 帧/秒'
+      + (T.attRate && best && best > T.attRate ? '\n⚠ 已到本机解码上限，量到的可能是 CPU 而不是通道' : '');
+  }
+
+  if (typeof __JSQR__ !== 'function') {
+    err('解码库没有加载成功，页面没法工作。\n'
+      + '  __JSQR__ 类型：' + (typeof __JSQR__)
+      + '　模块导出：' + (window.__LIBOUT__ || '无')
+      + '　初始化异常：' + (window.__LIBERR__ || '无')
+      + '\n  UA：' + navigator.userAgent
+      + '\n本文件应为 ' + '__EXPECT_SIZE__'.replace(/\s+$/, '')
+      + ' 字节；请核对大小（被截断就重新拷一份完整的过来）。');
+  }
+
+  function buildGrid() {
+    var g = $('grid');
+    g.innerHTML = '';
+    g.style.gridTemplateColumns = 'repeat(' + Math.min(40, st.total) + ', 1fr)';
+    for (var i = 0; i < st.total; i++) { g.appendChild(document.createElement('i')); }
+  }
+
+  function render(dt) {
+    var nodes = $('grid').children, i;
+    for (i = 0; i < nodes.length; i++) {
+      nodes[i].className = st.chunks[i] === undefined ? '' : 'ok';
+    }
+    $('prog').style.width = st.total ? (st.got / st.total * 100).toFixed(1) + '%' : '0%';
+    var now = Date.now();
+    var secs = (now - st.t0) / 1000;
+    // 滑动窗口：最近 3 秒里新收了多少字节
+    while (st.beat.length && now - st.beat[0].t > 3000) { st.beat.shift(); }
+    var winChars = 0, wi;
+    for (wi = 0; wi < st.beat.length; wi++) { winChars += st.beat[wi].b; }
+    var win = Math.min(3, Math.max(0.3, secs));
+    var kbs = winChars * 2 / 3 / 1024 / win;                 // 当前速率
+    var avg = secs > 1 ? (st.charsGot * 2 / 3 / 1024 / secs) : 0;   // 全程平均
+    var miss = [];
+    for (i = 0; i < st.total; i++) { if (st.chunks[i] === undefined) { miss.push(i); } }
+    var missLine = '';
+    if (st.total && st.got < st.total) {
+      var head = miss.slice(0, 8).join(',') + (miss.length > 8 ? ' …' : '');
+      missLine = '\n还缺 ' + miss.length + ' 帧（' + head + '），发送端下一轮会补';
+    }
+    var sps = st.samp.length > 1
+      ? (st.samp.length - 1) / ((st.samp[st.samp.length - 1] - st.samp[0]) / 1000) : 0;
+    var msAvg = st.msN ? Math.round(st.ms / st.msN) : 0;
+    var scrSps = st.scr.length > 1
+      ? (st.scr.length - 1) / ((st.scr[st.scr.length - 1] - st.scr[0]) / 1000) : 0;
+    // 采样明显跟不上时，把原因说出来：多半是页面在后台被浏览器限流
+    var limitLine = '';
+    if (st.running) {
+      if (document.hidden) {
+        limitLine = '\n⚠ 接收页在后台，浏览器会把采集限到约 1 帧/秒 —— 让这个页面保持可见再试';
+      } else if (st.tries > 20 && sps < 4) {
+        limitLine = '\n⚠ 每秒只采到 ' + sps.toFixed(1) + ' 帧：页面可能被其它窗口挡住了，或者本机解码跟不上（' + msAvg + ' ms/帧）';
+      }
+    }
+    $('stat').textContent = (st.name ? st.name + '\n' : '') + '已收 ' + st.got + '/' + (st.total || '?')
+      + '　·　' + kbs.toFixed(1) + ' KB/s（均 ' + avg.toFixed(1) + '）'
+      + '　·　解析 ' + scrSps.toFixed(1) + ' 屏/秒'
+      + '　·　送解 ' + sps.toFixed(1) + ' 次/秒　·　解码 ' + msAvg + ' ms/帧' + limitLine
+      + '　·　命中 ' + (st.tries ? Math.round(st.hits / st.tries * 100) : 0) + '%'
+      + (st.bad ? '　·　坏帧 ' + st.bad + '（已丢弃）' : '')
+      + (dt ? '　·　' + dt + ' ms/帧' : '')
+      + missLine;
+  }
+
+  function finish() {
+    if (finishTimer) { clearTimeout(finishTimer); finishTimer = null; }
+    if (!st.total || !st.size) { return; }
+    st.finished = true;
+    var parts = [], i;
+    for (i = 0; i < st.total; i++) { parts.push(st.chunks[i]); }
+    try {
+      var bytes = b44dec(parts.join('')).subarray(0, st.size);
+      var got = crc32(bytes);
+      if (got !== st.crc || bytes.length !== st.size) {
+        err('收齐了 ' + st.total + ' 帧，但校验不过（期望 ' + hex(st.crc, 8) + '，实际 ' + hex(got, 8) + '）。'
+          + '\n先不要停，让它继续播一轮再试；仍不行就把密度调低一档重发。');
+        st.finished = false;
+        st.chunks = {};
+        st.got = 0; st.charsGot = 0; st.beat = []; st.scr = [];
+        buildGrid(); render();
+        return;
+      }
+      var blob = new Blob([bytes], { type: 'application/octet-stream' });
+      var url = URL.createObjectURL(blob);
+      var saveName = st.name || 'received.bin';
+      st.doneGen[st.total + '|' + st.size + '|' + st.crc] = true;
+      st.doneList.push({ name: saveName, size: bytes.length, url: url });
+      while (st.doneList.length > 6) { URL.revokeObjectURL(st.doneList.shift().url); }
+      renderDone();
+      resetForNext('');           // 采集和锁定区域都留着，继续收下一个
+    } catch (e) {
+      err('还原失败：' + e.message);
+      st.finished = false;
+    }
+  }
+
+  // 清空这一次的接收状态，采集流 / 锁定区域 / 模式都不动
+  function resetForNext(gk) {
+    st.chunks = {}; st.got = 0; st.charsGot = 0;
+    st.beat = []; st.samp = []; st.scr = [];
+    st.total = 0; st.size = 0; st.crc = 0; st.name = '';
+    st.gen = gk || ''; st.finished = false; st.lastText = '';
+    st.ms = 0; st.msN = 0; st.hits = 0; st.misses = 0; st.dup = 0;
+    st.bad = 0; st.badM = 0; st.badF = 0; st.badV = 0;
+    st.tries = 0; st.t0 = Date.now();
+    doneHash = 0; sentHash = 0;
+    buildGrid(); render();
+  }
+
+  function renderDone() {
+    var d = $('done');
+    if (!st.doneList.length) { d.style.display = 'none'; d.innerHTML = ''; return; }
+    var html = '', i, it;
+    for (i = st.doneList.length - 1; i >= 0; i--) {
+      it = st.doneList[i];
+      html += '✔ 收齐并校验通过：' + it.size + ' 字节　<a href="' + it.url + '" download="'
+        + it.name.replace(/"/g, '&quot;') + '">保存 ' + it.name.replace(/</g, '&lt;') + '</a><br>';
+    }
+    if (st.running) { html += '<span class="next">还在接收：发送端换一个文件就会自动往下收</span>'; }
+    d.style.display = 'block';
+    d.innerHTML = html;
+  }
+
+  window.addEventListener('beforeunload', function () { if (st.running) { stop(); } });
+
+  initPool();          // 等 POOL / LIBSRC 都初始化完再建池
+  sync();
+
+  window.Wink2DRecv = {
+    state: function () {
+      return { got: st.got, total: st.total, bad: st.bad, dup: st.dup, finished: st.finished,
+               size: st.size, crc: st.crc, name: st.name, mode: MODE,
+               badM: st.badM, badF: st.badF, badV: st.badV, workers: POOL.ok ? POOL.ws.length : 0,
+               tries: st.tries, running: !!st.running, vw: video.videoWidth,
+               ms: st.msN ? Math.round(st.ms / st.msN) : 0, roi: ROI ? [ROI.x, ROI.y, ROI.w, ROI.h] : null,
+               subm: st.samp.length,
+               perr: window.__POOLERR__ || null, wready: POOL.ready || null,
+               werr: window.__WERR__ || null };
+    }
+  };
+})();
+</script>
+</body>
+</html>
